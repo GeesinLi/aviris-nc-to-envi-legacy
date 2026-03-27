@@ -39,7 +39,7 @@ pip install numpy h5py
 
 ## Usage
 
-1. Edit configuration at the top of `aviris_nc_to_envi_fixed_v2.py`:
+1. Edit configuration at the top of `aviris_nc_to_envi_fixed`:
 
 ```python
 INPUT_DIR = Path(r"D:\data")
