@@ -11,7 +11,7 @@ import re
 import h5py
 import numpy as np
 
-INPUT_DIR = Path(r"D:\data")
+INPUT_DIR = Path(r"D:\data\机场")
 OUTPUT_DIR = INPUT_DIR / "converted_envi"
 # Export ancillary lat/lon files. Set True only when needed.
 EXPORT_LATLON = False
@@ -19,6 +19,18 @@ EXPORT_LATLON = False
 ORTHORECTIFY_L1B_WITH_GLT = True
 # Attach richer source metadata into ENVI header as custom fields.
 INCLUDE_NC_METADATA_IN_HDR = True
+# Also write additional ENVI-standard-like optional fields for better UX in ENVI.
+INCLUDE_OPTIONAL_ENVI_STANDARD_FIELDS = True
+# Write ENVI bad bands list (bbl) if available or derivable.
+INCLUDE_BBL = True
+# If no explicit bbl exists in nc, derive from wavelength ranges (nm).
+AUTO_BBL_FROM_WAVELENGTH = True
+# Default set tuned to reproduce the cor-1 style BBL (249/284 kept).
+# Intervals are in nanometers and are applied only when no explicit BBL exists in nc.
+DEFAULT_BAD_BAND_RANGES_NM = [
+    (1350.0, 1433.0),
+    (1804.0, 1968.5),
+]
 
 CANDIDATE_CUBE_PATHS = [
     "/radiance/radiance",
@@ -48,6 +60,16 @@ CANDIDATE_NORTHING_PATHS = ["/northing", "/y", "/geolocation_lookup_table/northi
 # Used for L1B orthorectification.
 CANDIDATE_GLT_LINE_PATHS = ["/geolocation_lookup_table/line"]
 CANDIDATE_GLT_SAMPLE_PATHS = ["/geolocation_lookup_table/sample"]
+CANDIDATE_BBL_PATHS = [
+    "/bbl",
+    "/radiance/bbl",
+    "/reflectance/bbl",
+    "/good_wavelengths",
+    "/radiance/good_wavelengths",
+    "/reflectance/good_wavelengths",
+    "/quality/bbl",
+    "/quality/good_wavelengths",
+]
 
 SKIP_ATTR_KEYS_COMMON = {"DIMENSION_LIST", "REFERENCE_LIST", "_Netcdf4Coordinates", "CLASS", "NAME"}
 SKIP_ATTR_KEYS_GLOBAL = {"_NCProperties"}
@@ -93,6 +115,24 @@ def _format_envi_list(values: np.ndarray, per_line: int = 8) -> str:
     chunks = []
     for i in range(0, flat.size, per_line):
         row = ", ".join(f"{float(x):.6f}" for x in flat[i : i + per_line])
+        chunks.append("  " + row)
+    return "{\n" + ",\n".join(chunks) + "\n}"
+
+
+def _format_envi_int_list(values: np.ndarray, per_line: int = 32) -> str:
+    flat = np.asarray(values).reshape(-1).astype(np.int32)
+    chunks = []
+    for i in range(0, flat.size, per_line):
+        row = ", ".join(str(int(x)) for x in flat[i : i + per_line])
+        chunks.append("  " + row)
+    return "{\n" + ",\n".join(chunks) + "\n}"
+
+
+def _format_envi_str_list(values: List[str], per_line: int = 4) -> str:
+    safe = [_clean_header_text(v, max_len=120).replace(",", ";") for v in values]
+    chunks = []
+    for i in range(0, len(safe), per_line):
+        row = ", ".join(safe[i : i + per_line])
         chunks.append("  " + row)
     return "{\n" + ",\n".join(chunks) + "\n}"
 
@@ -171,6 +211,93 @@ def _format_attr_value_for_hdr(value) -> Optional[str]:
     return "{" + _clean_header_text(str(v)) + "}"
 
 
+def _normalize_bbl(values: np.ndarray, bands: int) -> Optional[np.ndarray]:
+    arr = np.asarray(values).reshape(-1)
+    if arr.size != bands:
+        return None
+
+    if arr.dtype.kind == "b":
+        return arr.astype(np.int32)
+
+    if arr.dtype.kind in {"i", "u", "f"}:
+        out = np.where(np.asarray(arr, dtype=float) > 0, 1, 0).astype(np.int32)
+        return out
+
+    # String-like masks: support common tokens.
+    try:
+        tokens = np.asarray(arr).astype(str)
+    except Exception:
+        return None
+    out = np.ones(bands, dtype=np.int32)
+    false_tokens = {"0", "false", "f", "bad", "invalid", "no"}
+    true_tokens = {"1", "true", "t", "good", "valid", "yes"}
+    for i, t in enumerate(tokens):
+        tt = t.strip().lower()
+        if tt in false_tokens:
+            out[i] = 0
+        elif tt in true_tokens:
+            out[i] = 1
+        else:
+            return None
+    return out
+
+
+def _derive_bbl_from_wavelengths(
+    wavelengths: Optional[np.ndarray],
+    bands: int,
+    units: Optional[str],
+) -> Optional[np.ndarray]:
+    if wavelengths is None:
+        return None
+
+    wl = np.asarray(wavelengths).reshape(-1).astype(float)
+    if wl.size != bands:
+        return None
+
+    # Work in nanometers.
+    if units == "Micrometers":
+        wl_nm = wl * 1000.0
+    else:
+        wl_nm = wl
+
+    bbl = np.ones(bands, dtype=np.int32)
+    for lo, hi in DEFAULT_BAD_BAND_RANGES_NM:
+        bad = (wl_nm >= lo) & (wl_nm <= hi)
+        bbl[bad] = 0
+    return bbl
+
+
+def _get_bbl(
+    h5: h5py.File,
+    group_prefix: str,
+    bands: int,
+    wavelengths: Optional[np.ndarray],
+    units: Optional[str],
+) -> Tuple[Optional[np.ndarray], str]:
+    cand = [f"{group_prefix}/bbl"] + CANDIDATE_BBL_PATHS
+    bbl_path = _find_existing_path(h5, cand)
+    if bbl_path:
+        norm = _normalize_bbl(h5[bbl_path][...], bands)
+        if norm is not None:
+            return norm, f"dataset:{bbl_path}"
+
+    # Some producers put mask-like attrs on wavelength variable.
+    wl_path = _find_existing_path(h5, [f"{group_prefix}/wavelength"] + CANDIDATE_WAVELENGTH_PATHS)
+    if wl_path:
+        for key in ("bbl", "good_wavelengths", "good_bands", "band_mask", "mask"):
+            if key in h5[wl_path].attrs:
+                norm = _normalize_bbl(h5[wl_path].attrs[key], bands)
+                if norm is not None:
+                    return norm, f"attr:{wl_path}:{key}"
+
+    if AUTO_BBL_FROM_WAVELENGTH:
+        derived = _derive_bbl_from_wavelengths(wavelengths, bands, units)
+        if derived is not None:
+            return derived, "derived:wavelength_ranges"
+
+    return None, "none"
+
+
 def _append_attrs_to_hdr_lines(
     hdr_lines: List[str],
     attrs,
@@ -188,11 +315,111 @@ def _append_attrs_to_hdr_lines(
         hdr_lines.append(f"{hdr_key} = {value_text}")
 
 
+def _append_attrs_from_path(
+    h5: h5py.File,
+    hdr_lines: List[str],
+    path: Optional[str],
+    prefix: str,
+    skip_keys: Optional[set] = None,
+) -> None:
+    if not path:
+        return
+    if path not in h5:
+        return
+    _append_attrs_to_hdr_lines(hdr_lines, h5[path].attrs, prefix, skip_keys=skip_keys)
+
+
+def _get_attr_str(attrs, key: str) -> Optional[str]:
+    if key not in attrs:
+        return None
+    v = _to_attr_python(attrs[key])
+    if v is None:
+        return None
+    if isinstance(v, (list, tuple)):
+        v = " ".join(str(x) for x in v)
+    s = str(v).strip()
+    return s if s else None
+
+
+def _build_band_names_from_wavelengths(wavelengths: np.ndarray, units: Optional[str]) -> List[str]:
+    wl = np.asarray(wavelengths).reshape(-1).astype(float)
+    if units == "Micrometers":
+        return [f"Band {i+1}: {w:.4f} um" for i, w in enumerate(wl)]
+    return [f"Band {i+1}: {w:.2f} nm" for i, w in enumerate(wl)]
+
+
+def _select_default_rgb_bands(wavelengths: np.ndarray, units: Optional[str]) -> Optional[Tuple[int, int, int]]:
+    wl = np.asarray(wavelengths).reshape(-1).astype(float)
+    if wl.size < 3:
+        return None
+
+    if units == "Micrometers":
+        targets = [0.65, 0.55, 0.45]  # R, G, B
+    else:
+        targets = [650.0, 550.0, 450.0]  # R, G, B
+
+    used = set()
+    chosen = []
+    for t in targets:
+        order = np.argsort(np.abs(wl - t))
+        pick = None
+        for idx in order:
+            i = int(idx)
+            if i not in used:
+                pick = i
+                break
+        if pick is None:
+            return None
+        used.add(pick)
+        chosen.append(pick + 1)  # ENVI bands are 1-based
+
+    return int(chosen[0]), int(chosen[1]), int(chosen[2])
+
+
 def _scalar_len(ds: h5py.Dataset) -> Optional[int]:
     arr = np.asarray(ds[...])
     if arr.ndim == 0:
         return None
     return int(arr.size)
+
+
+def _detect_axes_from_dimension_scales(h5: h5py.File, cube_path: str) -> Optional[Tuple[int, int, int]]:
+    if cube_path not in h5:
+        return None
+    ds = h5[cube_path]
+    if ds.ndim != 3:
+        return None
+
+    band_axis = None
+    line_axis = None
+    sample_axis = None
+
+    for ax in range(3):
+        try:
+            dim = ds.dims[ax]
+            if len(dim) < 1:
+                continue
+            scale = dim[0]
+            scale_name = getattr(scale, "name", None)
+            if not scale_name:
+                continue
+            base = str(scale_name).split("/")[-1].lower()
+        except Exception:
+            continue
+
+        if base in {"wavelength", "wavelengths", "band", "bands"}:
+            band_axis = ax
+        elif base in {"line", "lines", "northing", "y"}:
+            line_axis = ax
+        elif base in {"sample", "samples", "easting", "x"}:
+            sample_axis = ax
+
+    if None in {band_axis, line_axis, sample_axis}:
+        return None
+    if len({band_axis, line_axis, sample_axis}) != 3:
+        return None
+
+    return int(sample_axis), int(line_axis), int(band_axis)
 
 
 def _detect_axes(
@@ -381,6 +608,28 @@ def _parse_utm_info_from_wkt(wkt: Optional[str]) -> Tuple[Optional[int], Optiona
     return None, None, datum
 
 
+def _parse_geotransform_attr(value) -> Optional[Tuple[float, float, float, float, float, float]]:
+    if value is None:
+        return None
+    val = _decode_attr(value)
+    if isinstance(val, list):
+        val = " ".join(str(x) for x in val)
+
+    nums: List[float] = []
+    if isinstance(val, str):
+        nums = [float(x) for x in re.findall(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", val)]
+    else:
+        try:
+            arr = np.asarray(val).reshape(-1).astype(float)
+            nums = [float(x) for x in arr.tolist()]
+        except Exception:
+            return None
+
+    if len(nums) < 6:
+        return None
+    return nums[0], nums[1], nums[2], nums[3], nums[4], nums[5]
+
+
 def _build_mapinfo_and_crs_lines(
     h5: h5py.File,
     lines: int,
@@ -406,26 +655,39 @@ def _build_mapinfo_and_crs_lines(
     if easting.size < 2 or northing.size < 2:
         return []
 
-    x_ref = float(easting[0])
-    y_ref = float(northing[0])
-    x_res = float(abs(np.nanmedian(np.diff(easting))))
-    y_res = float(abs(np.nanmedian(np.diff(northing))))
-
     wkt = None
+    gt = None
     if "/transverse_mercator" in h5:
-        wkt = _decode_text_attr(h5["/transverse_mercator"].attrs, "crs_wkt") or _decode_text_attr(
+        tm = h5["/transverse_mercator"]
+        wkt = _decode_text_attr(tm.attrs, "crs_wkt") or _decode_text_attr(
             h5["/transverse_mercator"].attrs, "spatial_ref"
         )
+        gt = _parse_geotransform_attr(tm.attrs.get("GeoTransform"))
+
+    if gt is not None:
+        gt0, gt1, gt2, gt3, gt4, gt5 = gt
+        # GeoTransform uses pixel corner; ENVI map info expects center of reference pixel (1,1).
+        x_ref = float(gt0 + 0.5 * (gt1 + gt2))
+        y_ref = float(gt3 + 0.5 * (gt4 + gt5))
+        x_res = float((gt1 * gt1 + gt4 * gt4) ** 0.5)
+        y_res = float((gt2 * gt2 + gt5 * gt5) ** 0.5)
+        rotation = float(np.degrees(np.arctan2(gt4, gt1)))
+    else:
+        x_ref = float(easting[0])
+        y_ref = float(northing[0])
+        x_res = float(abs(np.nanmedian(np.diff(easting))))
+        y_res = float(abs(np.nanmedian(np.diff(northing))))
+        rotation = 0.0
 
     zone, hemi, datum = _parse_utm_info_from_wkt(wkt)
     out: List[str] = []
     if zone is not None and hemi is not None:
         out.append(
-            f"map info = {{UTM, 1, 1, {x_ref:.6f}, {y_ref:.6f}, {x_res:.6f}, {y_res:.6f}, {zone}, {hemi}, {datum}, units=Meters}}"
+            f"map info = {{UTM, 1, 1, {x_ref:.6f}, {y_ref:.6f}, {x_res:.6f}, {y_res:.6f}, {zone}, {hemi}, {datum}, units=Meters, rotation={rotation:.6f}}}"
         )
     else:
         out.append(
-            f"map info = {{Arbitrary, 1, 1, {x_ref:.6f}, {y_ref:.6f}, {x_res:.6f}, {y_res:.6f}, units=Meters}}"
+            f"map info = {{Arbitrary, 1, 1, {x_ref:.6f}, {y_ref:.6f}, {x_res:.6f}, {y_res:.6f}, units=Meters, rotation={rotation:.6f}}}"
         )
 
     if wkt:
@@ -487,6 +749,10 @@ def convert_one_nc(nc_path: Path, out_dir: Path, export_latlon: bool = False) ->
         fwhm_path = _find_existing_path(h5, [f"{group_prefix}/fwhm"] + CANDIDATE_FWHM_PATHS)
         lines_path = _find_existing_path(h5, CANDIDATE_LINES_PATHS)
         samples_path = _find_existing_path(h5, CANDIDATE_SAMPLES_PATHS)
+        easting_path = _find_existing_path(h5, ["/easting", "/x"])
+        northing_path = _find_existing_path(h5, ["/northing", "/y"])
+        lat_path = _find_existing_path(h5, CANDIDATE_LAT_PATHS)
+        lon_path = _find_existing_path(h5, CANDIDATE_LON_PATHS)
         glt_line_path = _find_existing_path(h5, CANDIDATE_GLT_LINE_PATHS)
         glt_sample_path = _find_existing_path(h5, CANDIDATE_GLT_SAMPLE_PATHS)
 
@@ -502,7 +768,9 @@ def convert_one_nc(nc_path: Path, out_dir: Path, export_latlon: bool = False) ->
         sample_len = _scalar_len(h5[samples_path]) if samples_path else None
         wavelength_count = int(wavelengths.size) if wavelengths is not None else None
 
-        axes = _detect_axes(tuple(int(x) for x in cube_ds.shape), wavelength_count, line_len, sample_len)
+        axes = _detect_axes_from_dimension_scales(h5, cube_path)
+        if axes is None:
+            axes = _detect_axes(tuple(int(x) for x in cube_ds.shape), wavelength_count, line_len, sample_len)
         sample_axis, line_axis, band_axis = axes
         bands = int(cube_ds.shape[band_axis])
 
@@ -529,6 +797,17 @@ def convert_one_nc(nc_path: Path, out_dir: Path, export_latlon: bool = False) ->
         if units is None and wavelengths is not None:
             units = _infer_units_from_values(wavelengths)
 
+        bbl = None
+        bbl_source = "none"
+        if INCLUDE_BBL:
+            bbl, bbl_source = _get_bbl(
+                h5=h5,
+                group_prefix=group_prefix,
+                bands=bands,
+                wavelengths=wavelengths,
+                units=units,
+            )
+
         fill_value = _decode_attr(cube_ds.attrs.get("_FillValue"))
         if isinstance(fill_value, np.ndarray):
             fill_value = float(np.asarray(fill_value).reshape(-1)[0])
@@ -551,13 +830,26 @@ def convert_one_nc(nc_path: Path, out_dir: Path, export_latlon: bool = False) ->
         else:
             samples, lines, bands = _write_binary_bsq(cube, out_data, axes)
 
+        title_attr = _get_attr_str(h5.attrs, "title")
+        summary_attr = _get_attr_str(h5.attrs, "summary")
+        desc_extra_parts = []
+        if title_attr:
+            desc_extra_parts.append(f"title={_clean_header_text(title_attr, max_len=220)}")
+        if summary_attr:
+            desc_extra_parts.append(f"summary={_clean_header_text(summary_attr, max_len=260)}")
+        desc_extra = "; ".join(desc_extra_parts)
+
+        base_desc = (
+            f"Converted from {nc_path.name}, source dataset {cube_path}, "
+            f"cube_shape={cube_ds.shape}, axes(sample,line,band)={axes}, "
+            f"orthorectified={'True' if use_glt else 'False'}"
+        )
+        if desc_extra:
+            base_desc = f"{base_desc}; {desc_extra}"
+
         hdr_lines = [
             "ENVI",
-            (
-                f"description = {{Converted from {nc_path.name}, source dataset {cube_path}, "
-                f"cube_shape={cube_ds.shape}, axes(sample,line,band)={axes}, "
-                f"orthorectified={'True' if use_glt else 'False'}}}"
-            ),
+            f"description = {{{_clean_header_text(base_desc)}}}",
             f"samples = {samples}",
             f"lines   = {lines}",
             f"bands   = {bands}",
@@ -579,6 +871,39 @@ def convert_one_nc(nc_path: Path, out_dir: Path, export_latlon: bool = False) ->
 
         if fwhm is not None:
             hdr_lines.append(f"fwhm = {_format_envi_list(fwhm)}")
+        if bbl is not None:
+            hdr_lines.append(f"bbl = {_format_envi_int_list(bbl)}")
+            hdr_lines.append(f"nc_bbl_source = {{{bbl_source}}}")
+
+        if INCLUDE_OPTIONAL_ENVI_STANDARD_FIELDS:
+            sensor_type = _get_attr_str(h5.attrs, "sensor")
+            if sensor_type:
+                hdr_lines.append(f"sensor type = {{{_clean_header_text(sensor_type, max_len=120)}}}")
+
+            acq_start = _get_attr_str(h5.attrs, "time_coverage_start")
+            acq_end = _get_attr_str(h5.attrs, "time_coverage_end")
+            if acq_start and acq_end:
+                hdr_lines.append(
+                    f"acquisition time = {{{_clean_header_text(acq_start, max_len=80)} / {_clean_header_text(acq_end, max_len=80)}}}"
+                )
+            elif acq_start:
+                hdr_lines.append(f"acquisition time = {{{_clean_header_text(acq_start, max_len=80)}}}")
+
+            cube_units = _get_attr_str(cube_ds.attrs, "units")
+            if not cube_units and cube_path.startswith("/reflectance/"):
+                cube_units = "unitless"
+            if cube_units:
+                hdr_lines.append(f"data units = {{{_clean_header_text(cube_units, max_len=120)}}}")
+
+            if wavelengths is not None and wavelengths.size == bands:
+                band_names = _build_band_names_from_wavelengths(wavelengths, units)
+                if band_names:
+                    hdr_lines.append(f"band names = {_format_envi_str_list(band_names)}")
+
+                rgb = _select_default_rgb_bands(wavelengths, units)
+                if rgb is not None:
+                    r, g, b = rgb
+                    hdr_lines.append(f"default bands = {{{r}, {g}, {b}}}")
 
         mapinfo_lines = _build_mapinfo_and_crs_lines(h5, lines=lines, samples=samples, prefer_glt=use_glt)
         hdr_lines.extend(mapinfo_lines)
@@ -607,13 +932,34 @@ def convert_one_nc(nc_path: Path, out_dir: Path, export_latlon: bool = False) ->
                     "nc_crs",
                     skip_keys=set(),
                 )
+            _append_attrs_from_path(
+                h5, hdr_lines, "/geolocation_lookup_table", "nc_glt", skip_keys=SKIP_ATTR_KEYS_COMMON
+            )
+            _append_attrs_from_path(
+                h5, hdr_lines, "/geolocation_lookup_table/easting", "nc_glt_x", skip_keys=SKIP_ATTR_KEYS_COMMON
+            )
+            _append_attrs_from_path(
+                h5, hdr_lines, "/geolocation_lookup_table/northing", "nc_glt_y", skip_keys=SKIP_ATTR_KEYS_COMMON
+            )
+            _append_attrs_from_path(
+                h5, hdr_lines, glt_line_path, "nc_glt_line", skip_keys=SKIP_ATTR_KEYS_COMMON
+            )
+            _append_attrs_from_path(
+                h5, hdr_lines, glt_sample_path, "nc_glt_sample", skip_keys=SKIP_ATTR_KEYS_COMMON
+            )
+            _append_attrs_from_path(h5, hdr_lines, easting_path, "nc_x", skip_keys=SKIP_ATTR_KEYS_COMMON)
+            _append_attrs_from_path(h5, hdr_lines, northing_path, "nc_y", skip_keys=SKIP_ATTR_KEYS_COMMON)
+            _append_attrs_from_path(h5, hdr_lines, lines_path, "nc_lines", skip_keys=SKIP_ATTR_KEYS_COMMON)
+            _append_attrs_from_path(
+                h5, hdr_lines, samples_path, "nc_samples", skip_keys=SKIP_ATTR_KEYS_COMMON
+            )
+            _append_attrs_from_path(h5, hdr_lines, lat_path, "nc_lat", skip_keys=SKIP_ATTR_KEYS_COMMON)
+            _append_attrs_from_path(h5, hdr_lines, lon_path, "nc_lon", skip_keys=SKIP_ATTR_KEYS_COMMON)
 
         hdr_lines.append(f"dataset names = {cube_path}")
         out_hdr.write_text("\n".join(hdr_lines) + "\n", encoding="utf-8")
 
         if export_latlon:
-            lat_path = _find_existing_path(h5, CANDIDATE_LAT_PATHS)
-            lon_path = _find_existing_path(h5, CANDIDATE_LON_PATHS)
             if lat_path and lon_path:
                 lat = np.asarray(h5[lat_path][...], dtype=np.float32)
                 lon = np.asarray(h5[lon_path][...], dtype=np.float32)
