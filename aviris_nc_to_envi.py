@@ -21,6 +21,9 @@ ORTHORECTIFY_L1B_WITH_GLT = True
 INCLUDE_NC_METADATA_IN_HDR = True
 # Also write additional ENVI-standard-like optional fields for better UX in ENVI.
 INCLUDE_OPTIONAL_ENVI_STANDARD_FIELDS = True
+# ENVI 5.x compatibility: some builds align better when map info uses pixel-corner
+# reference (GeoTransform origin) instead of pixel-center for projected products.
+ENVI_LEGACY_MAPINFO_USES_PIXEL_CORNER = True
 # Write ENVI bad bands list (bbl) if available or derivable.
 INCLUDE_BBL = True
 # If no explicit bbl exists in nc, derive from wavelength ranges (nm).
@@ -666,12 +669,19 @@ def _build_mapinfo_and_crs_lines(
 
     if gt is not None:
         gt0, gt1, gt2, gt3, gt4, gt5 = gt
-        # GeoTransform uses pixel corner; ENVI map info expects center of reference pixel (1,1).
-        x_ref = float(gt0 + 0.5 * (gt1 + gt2))
-        y_ref = float(gt3 + 0.5 * (gt4 + gt5))
+        use_corner_ref = ENVI_LEGACY_MAPINFO_USES_PIXEL_CORNER and (not prefer_glt)
+        if use_corner_ref:
+            x_ref = float(gt0)
+            y_ref = float(gt3)
+        else:
+            # GeoTransform uses pixel corner; ENVI map info commonly uses center of reference pixel (1,1).
+            x_ref = float(gt0 + 0.5 * (gt1 + gt2))
+            y_ref = float(gt3 + 0.5 * (gt4 + gt5))
         x_res = float((gt1 * gt1 + gt4 * gt4) ** 0.5)
         y_res = float((gt2 * gt2 + gt5 * gt5) ** 0.5)
         rotation = float(np.degrees(np.arctan2(gt4, gt1)))
+        if abs(rotation) < 1e-10:
+            rotation = 0.0
     else:
         x_ref = float(easting[0])
         y_ref = float(northing[0])
