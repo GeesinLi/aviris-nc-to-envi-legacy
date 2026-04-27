@@ -97,4 +97,4 @@ Primary goal: convert AVIRIS NetCDF into ENVI products that open and behave corr
 
 ## License
 
-Add a license file before publishing (recommended: MIT).
+MIT.
