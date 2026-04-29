@@ -11,7 +11,7 @@ import re
 import h5py
 import numpy as np
 
-INPUT_DIR = Path(r"D:\data\机场")
+INPUT_DIR = Path(r"D:\data\")
 OUTPUT_DIR = INPUT_DIR / "converted_envi"
 # Export ancillary lat/lon files. Set True only when needed.
 EXPORT_LATLON = False
